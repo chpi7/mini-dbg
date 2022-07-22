@@ -1,9 +1,10 @@
 #include <stdio.h>
 
 int main(int argc, char** argv) {
-    int x = 1;
-    int y = 2;
-    int z = x + y;
-    printf("%d\n", z);
-    printf("Hello\n");
+    FILE *fp;
+
+    fp = fopen("myfile.txt", "w+");
+    // fprintf(fp, "Main is at 0x%x\n", (unsigned)main);
+    fprintf(stdout, "Main is at 0x%x\n", (unsigned)main);
+    fclose(fp);
 }
