@@ -4,20 +4,26 @@ use nix::sys::signal::Signal;
 use nix::sys::wait::{wait, WaitStatus};
 use nix::sys::{personality, ptrace};
 use nix::unistd::{fork, ForkResult, Pid};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi;
 use std::io::{stdin, stdout, Write};
+use std::mem::size_of;
+
+use crate::debuginfo::DebugInfo;
+use crate::util::get_base_address;
 
 pub struct Debugger {
     target: String,
     child_pid: Option<Pid>,
-    breakpoints: HashMap<u64, Breakpoint>
+    breakpoints: HashMap<usize, Breakpoint>,
+    breakpoint_restore_info: HashMap<usize, u8>,
+    breakpoints_outstanding: HashSet<usize>,
+    debug_info: DebugInfo,
 }
 
 #[derive(Debug)]
 enum Breakpoint {
-    Address(u64),
-    Name(String)
+    Address(usize),
 }
 
 #[derive(Debug)]
@@ -26,24 +32,26 @@ enum ReplCommand {
     Continue,
     Exit,
     Unknown,
-    SetBp(Breakpoint),
-    DeleteBp(Breakpoint),
+    SetBp(usize),
+    DeleteBp(usize),
     GetRegs,
     SingleStep,
 }
 
 impl Debugger {
     pub fn create(target: String) -> Debugger {
+        let debug_info = DebugInfo::create(&target);
         Debugger {
             target: target,
             child_pid: Option::None,
             breakpoints: HashMap::new(),
+            breakpoint_restore_info: HashMap::new(),
+            breakpoints_outstanding: HashSet::new(),
+            debug_info,
         }
     }
 
     pub fn run(&mut self) -> Result<(), ()> {
-        
-        println!("mini-dbg v0.1");
 
         self.run_repl();
 
@@ -52,19 +60,27 @@ impl Debugger {
 
     fn run_repl(&mut self) {
         loop {
-            
             let cmd = self.get_command();
-            
+
             if let ReplCommand::Exit = cmd {
-                return
+                if let Some(pid) = self.child_pid {
+                    ptrace::kill(pid).expect("Could not kill child process.");
+                }
+                return;
             }
-            
+
             if self.handle_command(cmd) {
                 match self.wait_for_child() {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        if let Some(pid) = self.child_pid {
+                            let rip = ptrace::getregs(pid).unwrap().rip as usize;
+                            let base = get_base_address(pid).expect("Could not get base address");
+                            self.debug_info.get_location(rip - base);
+                        }
+                    }
                     Err(err) => {
                         println!("Got error {}", err);
-                        break
+                        break;
                     }
                 }
             }
@@ -78,13 +94,16 @@ impl Debugger {
         print!("> ");
         stdout().flush().unwrap();
         stdin().read_line(&mut input).expect("Could not read line");
-        
+
         match input.trim() {
-            "cont" => { ReplCommand::Continue }
-            "start" => { ReplCommand::Start }
-            "exit" => { ReplCommand::Exit }
-            "regs" => { ReplCommand::GetRegs }
-            "s" => { ReplCommand::SingleStep }
+            "cont" => ReplCommand::Continue,
+            "c" => ReplCommand::Continue,
+            "start" => ReplCommand::Start,
+            "exit" => ReplCommand::Exit,
+            "e" => ReplCommand::Exit,
+            "regs" => ReplCommand::GetRegs,
+            "r" => ReplCommand::GetRegs,
+            "s" => ReplCommand::SingleStep,
             _ => {
                 if input.starts_with("bp") {
                     let parts: Vec<&str> = input.trim().split(' ').collect();
@@ -97,10 +116,10 @@ impl Debugger {
                         } else {
                             ReplCommand::DeleteBp
                         };
-                        parts[2].parse::<u64>().map_or_else(
-                            |_| bp_type(Breakpoint::Name(String::from(parts[2]))), 
-                            |v| bp_type(Breakpoint::Address(v))
-                        )
+                        let parsed_addr = self
+                            .parse_address(parts[2])
+                            .expect("Address could not be parsed.");
+                        bp_type(parsed_addr)
                     }
                 } else {
                     ReplCommand::Unknown
@@ -109,9 +128,17 @@ impl Debugger {
         }
     }
 
+    fn parse_address(&self, addr: &str) -> Option<usize> {
+        let addr_without_0x = if addr.to_lowercase().starts_with("0x") {
+            &addr[2..]
+        } else {
+            &addr
+        };
+        usize::from_str_radix(addr_without_0x, 16).ok()
+    }
+
     /// Returns true if we should run the child, and false if not.
     fn handle_command(&mut self, cmd: ReplCommand) -> bool {
-
         match cmd {
             ReplCommand::Start => {
                 self.start_child().expect("could not start child process");
@@ -120,20 +147,39 @@ impl Debugger {
 
             ReplCommand::Continue => {
                 if let Some(pid) = self.child_pid {
+                    let rip = ptrace::getregs(pid).expect("Could not read registers").rip;
+                    let addresses_to_set: Vec<usize> = (&self.breakpoints_outstanding)
+                        .into_iter()
+                        .map(|v| (*v))
+                        .collect();
+                    self.breakpoints_outstanding.clear();
+                    
+                    let mut perform_one_singlestep = false;
+                    for addr in addresses_to_set {
+                        perform_one_singlestep |= rip == (addr as u64);
+                        self.set_breakpoint(addr)
+                            .expect("Could not re-set breakpoint.");
+                    }
+                    if perform_one_singlestep {
+                        println!("Jump over re-set bp");
+                        ptrace::step(pid, None).expect("Could not single step");
+                        wait().expect("wait for child while stepping over re-set bp failed.");
+                    }
                     ptrace::cont(pid, None).expect("Failed continue process");
+
                     true
                 } else {
                     false
                 }
             }
 
-            ReplCommand::SetBp(bp) => {
-                self.set_breakpoint(bp).unwrap();
+            ReplCommand::SetBp(addr) => {
+                self.set_breakpoint(addr).unwrap();
                 false
             }
 
-            ReplCommand::DeleteBp(bp) => {
-                self.delete_breakpoint(bp).unwrap();
+            ReplCommand::DeleteBp(addr) => {
+                self.restore_breakpoint(addr).unwrap();
                 false
             }
 
@@ -143,7 +189,8 @@ impl Debugger {
             }
 
             ReplCommand::GetRegs => {
-                let regs = ptrace::getregs(self.child_pid.unwrap()).expect("Could not read registers");
+                let regs =
+                    ptrace::getregs(self.child_pid.unwrap()).expect("Could not read registers");
                 println!("{:?}", regs);
                 false
             }
@@ -153,91 +200,104 @@ impl Debugger {
                 false
             }
         }
-
     }
 
-    fn set_breakpoint(&mut self, bp: Breakpoint) -> Result<(),()> {        
-        let addr = match bp {
-            Breakpoint::Address(a) => { Some(a) }
-            Breakpoint::Name(ref n) => { self.get_symbol_address(n) }
-        };
+    fn set_breakpoint(&mut self, addr: usize) -> Result<(), nix::Error> {
+        let old_byte = self.write_byte(addr, 0xcc)?;
+        println!("Breakpoint at {:#x} added.", addr);
+        self.breakpoints.insert(addr, Breakpoint::Address(addr));
+        self.breakpoint_restore_info.insert(addr, old_byte);
 
-        if let Some(addr) = addr {
-            println!("{:?} added.", bp);
+        Ok(())
+    }
 
-            self.breakpoints.insert(addr, bp);
-            Ok(())
+    fn restore_breakpoint(&mut self, addr: usize) -> Result<bool, nix::Error> {
+        if let Some(old_byte) = self.breakpoint_restore_info.get(&addr) {
+            self.write_byte(addr, *old_byte).ok();
+            Ok(true)
         } else {
-            println!("Breakpoint could not be resolved to address. {:?}", bp);
-            Err(())
+            println!("No restore info at address {:#x} found.", addr);
+            Ok(false)
         }
     }
 
-    fn delete_breakpoint(&mut self, bp: Breakpoint) -> Result<(),()> {
-        let addr = match bp {
-            Breakpoint::Address(a) => { Some(a) }
-            Breakpoint::Name(ref n) => { self.get_symbol_address(n) }
-        };
+    fn align_addr_to_word(&self, addr: usize) -> usize {
+        addr & (-(size_of::<usize>() as isize) as usize)
+    }
 
-        if let Some(ref addr) = addr {
-            if self.breakpoints.contains_key(addr) {
-                self.breakpoints.remove(addr);
-                println!("{:?} deleted.", bp);
-            } else {
-                println!("Breakpoint {:?} does not exist", bp);
-            }
-            Ok(())
-        } else {
-            println!("Breakpoint could not be resolved to address. {:?}", bp);
-            Err(())
+    fn write_byte(&self, addr: usize, byte: u8) -> Result<u8, nix::Error> {
+        let aligned_addr = self.align_addr_to_word(addr);
+        let byte_offset = addr - aligned_addr;
+        let word =
+            ptrace::read(self.child_pid.unwrap(), aligned_addr as ptrace::AddressType)? as u64;
+        let orig_byte = (word >> 8 * byte_offset) & 0xff;
+        let masked_word = word & !(0xff << 8 * byte_offset);
+        let updated_word = masked_word | ((byte as u64) << 8 * byte_offset);
+        // println!(
+        //     "Replace at {:#018x}: {:#18x} -> {:#18x}",
+        //     aligned_addr, word, updated_word
+        // );
+        unsafe {
+            ptrace::write(
+                self.child_pid.unwrap(),
+                aligned_addr as ptrace::AddressType,
+                updated_word as *mut std::ffi::c_void,
+            )?;
         }
+        Ok(orig_byte as u8)
     }
 
-    fn get_symbol_address(&self, _name: &str) -> Option<u64> {
-        None
-    }
-
-    fn wait_for_child(&self) -> Result<(), &str> {
-
+    fn wait_for_child(&mut self) -> Result<(), nix::Error> {
         if let None = self.child_pid {
             // println!("Child not running. Start with 'run'");
             return Ok(());
         }
 
-        match wait() {
-            Ok(WaitStatus::Stopped(_pid, sig_num)) => match sig_num {
+        match wait()? {
+            WaitStatus::Stopped(_pid, sig_num) => match sig_num {
                 Signal::SIGTRAP => {
-                    Ok(())
+                    println!("Got SIGTRAP");
+
+                    // restore bp so user does not see it
+                    let mut regs =
+                        ptrace::getregs(self.child_pid.unwrap()).expect("Could not get registers");
+                    let rip = (regs.rip - 1) as usize;
+
+                    // only mark for restoring if it was out own breakpoint
+                    if self.restore_breakpoint(rip)? {
+                        // save bp for restoring on cont
+                        self.breakpoints_outstanding.insert(rip);
+
+                        // wind back rip by one
+                        regs.rip -= 1;
+                        ptrace::setregs(self.child_pid.unwrap(), regs)
+                            .expect("Could not write registers");
+                    }
                 }
 
                 Signal::SIGSEGV => {
-                    Err("Got SIGSEGV")
+                    println!("Got SIGSEGV");
                 }
 
-                _ => {
-                    Ok(())
+                signal => {
+                    println!("Got signal {}", signal);
                 }
             },
 
-            Ok(WaitStatus::Exited(_pid, exit_status)) => {
+            WaitStatus::Exited(_, exit_status) => {
                 println!("Child exited with status {}", exit_status);
-                Ok(())
+                self.child_pid = None;
             }
 
-            Ok(status) => {
+            status => {
                 println!("Received status {:?}", status);
-                Ok(())
-            }
-
-            Err(err) => {
-                println!("Got error {:?}", err);
-                Err(err.desc())
             }
         }
+
+        Ok(())
     }
 
-    fn start_child(&mut self) -> Result<(),()> {
-
+    fn start_child(&mut self) -> Result<(), ()> {
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
                 run_child(&self.target);

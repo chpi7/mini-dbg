@@ -7,3 +7,6 @@ edition = "2021"
 
 [dependencies]
 nix = "0.24.1"
+gimli = "0.26.2"
+addr2line = "0.18.0"
+memmap2 = "0.5.5"
