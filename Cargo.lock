@@ -139,6 +139,7 @@ dependencies = [
  "gimli",
  "memmap2",
  "nix",
+ "object",
 ]
 
 [[package]]

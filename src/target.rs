@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::ffi;
+use std::ffi::{self, c_void};
 use std::mem::size_of;
 
 use nix::libc;
@@ -9,7 +9,7 @@ use nix::sys::wait::{wait, WaitStatus};
 use nix::sys::{personality, ptrace};
 use nix::unistd::{fork, ForkResult, Pid};
 
-use crate::debuginfo::DebugInfo;
+use crate::debuginfo::{DebugInfo, Location};
 use crate::util::get_base_address;
 
 pub struct Breakpoint {
@@ -22,7 +22,7 @@ pub struct Breakpoint {
 
 impl Breakpoint {
     pub fn pprint(&self, debug_info: &DebugInfo, base_address: usize) {
-        let location = debug_info.get_function_at_addr(self.address - base_address);
+        let location = debug_info.get_location_at_addr(self.address - base_address);
         if let Some(location) = location {
             print!("Breakpoint {} at {}", self.idx, location);
         } else {
@@ -44,6 +44,7 @@ impl Target {
     pub fn create(target: &str) -> Result<Target, nix::Error> {
         let pid = Target::fork_child(target)?;
         let debug_info = DebugInfo::create(target);
+        debug_info.dump_info().unwrap();
         Ok(Target {
             _executable_path: String::from(target),
             pid,
@@ -52,6 +53,35 @@ impl Target {
             breakpoints: HashMap::new(),
             debug_info,
         })
+    }
+
+    pub fn get_current_location(&self) -> Option<Location> {
+        self.debug_info.get_location_at_addr(self.get_virtual_address())
+    }
+
+    pub fn get_virtual_address(&self) -> usize {
+        let regs = ptrace::getregs(self.pid).expect("Could not get registers.");
+        (regs.rip as usize) - self.base_address
+    }
+
+    pub fn print_current_source_line(&self, range: usize) {
+        let addr = self.get_virtual_address();
+        self.debug_info.print_code_at_addr(addr, range)
+    }
+
+    pub fn print_backtrace(&self) {
+        let regs = ptrace::getregs(self.pid).expect("Could not get registers.");
+
+        let mut rbp = regs.rbp;
+
+        while {
+            println!("rbp = {:#x}", rbp);
+            if let Some(location) = self.debug_info.get_location_at_addr(regs.rip as usize - self.base_address + 8) {
+                println!("{}", location);
+            }
+            rbp = ptrace::read(self.pid, rbp as *mut c_void).expect("Could not read memory") as u64;
+            rbp != 0x0
+        } {}
     }
 
     pub fn print_registers(&self) -> Result<(), nix::Error> {
@@ -159,7 +189,8 @@ impl Target {
 
     pub fn list_breakpoints(&self) {
         for (_, breakpoint) in &self.breakpoints {
-            println!("Breakpoint {} at {:#x}", breakpoint.idx, breakpoint.address);
+            breakpoint.pprint(&self.debug_info, self.base_address);
+            println!("");
         }
     }
 

@@ -11,6 +11,8 @@ pub enum ReplCommand {
     ListBps,
     GetRegs,
     SingleStep,
+    Backtrace,
+    Frame,
 }
 
 /// Very sophisticated command parser.
@@ -24,13 +26,16 @@ pub fn get_command() -> ReplCommand {
     match input.trim() {
         "cont" => ReplCommand::Continue,
         "c" => ReplCommand::Continue,
+        "r" => ReplCommand::Continue,
         "start" => ReplCommand::Start,
         "exit" => ReplCommand::Exit,
         "e" => ReplCommand::Exit,
         "regs" => ReplCommand::GetRegs,
-        "r" => ReplCommand::GetRegs,
         "s" => ReplCommand::SingleStep,
         "lsb" => ReplCommand::ListBps,
+        "back" => ReplCommand::Backtrace,
+        "frame" => ReplCommand::Frame,
+        "f" => ReplCommand::Frame,
         _ => {
             if input.starts_with("bp") {
                 let parts: Vec<&str> = input.trim().split(' ').collect();
