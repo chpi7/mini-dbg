@@ -7,6 +7,7 @@ pub enum ReplCommand {
     Exit,
     Unknown,
     SetBp(usize),
+    SetBpName(String),
     DeleteBp(usize),
     ListBps,
     GetRegs,
@@ -43,14 +44,21 @@ pub fn get_command() -> ReplCommand {
                     println!("Too few arguments in bp command");
                     ReplCommand::Unknown
                 } else {
-                    let bp_type = if parts[1] == "set" {
-                        ReplCommand::SetBp
+                    let is_set = parts[1] == "set";
+                    if let Some(parsed_addr) = parse_address(parts[2]) {
+                        if is_set {
+                            ReplCommand::SetBp(parsed_addr)
+                        } else {
+                            ReplCommand::DeleteBp(parsed_addr) // this is an index of the bp!
+                        }
                     } else {
-                        ReplCommand::DeleteBp
-                    };
-                    let parsed_addr =
-                        parse_address(parts[2]).expect("Address could not be parsed.");
-                    bp_type(parsed_addr)
+                        if is_set {
+                            ReplCommand::SetBpName(String::from(parts[2]))
+                        } else {
+                            println!("DeleteBp requires a number as an argument.");
+                            ReplCommand::Unknown
+                        }
+                    }
                 }
             } else {
                 ReplCommand::Unknown

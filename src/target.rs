@@ -34,17 +34,16 @@ impl Breakpoint {
 pub struct Target {
     _executable_path: String,
     pid: Pid,
-    base_address: usize,
+    pub base_address: usize,
     next_bp_num: u32,
     pub breakpoints: HashMap<usize, Breakpoint>,
-    debug_info: DebugInfo,
+    pub debug_info: DebugInfo,
 }
 
 impl Target {
     pub fn create(target: &str) -> Result<Target, nix::Error> {
         let pid = Target::fork_child(target)?;
         let debug_info = DebugInfo::create(target);
-        debug_info.dump_info().unwrap();
         Ok(Target {
             _executable_path: String::from(target),
             pid,
