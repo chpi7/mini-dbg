@@ -95,7 +95,7 @@ impl DebugInfo {
             if let Ok(line) = line {
                 let diff = (idx + 1).abs_diff(location.line as usize);
                 if diff <= range {
-                    println!("{}\t{}", if diff == 0 { "->" } else { "  " }, line.as_str());
+                    println!("{}\t{}", if diff == 0 { "⇒" } else { "  " }, line.as_str());
                 }
             }
         }
