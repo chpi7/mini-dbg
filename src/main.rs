@@ -3,6 +3,7 @@ mod debuginfo;
 mod replcommand;
 mod target;
 mod util;
+mod gimliwrapper;
 
 use crate::debugger::Debugger;
 

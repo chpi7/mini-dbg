@@ -10,7 +10,7 @@ use nix::sys::{personality, ptrace};
 use nix::unistd::{fork, ForkResult, Pid};
 
 use crate::debuginfo::{DebugInfo, Location};
-use crate::util::get_base_address;
+use crate::util::{add_offset, get_base_address};
 
 pub struct Breakpoint {
     pub address: usize,
@@ -55,12 +55,74 @@ impl Target {
     }
 
     pub fn get_current_location(&self) -> Option<Location> {
-        self.debug_info.get_location_at_addr(self.get_virtual_address())
+        self.debug_info
+            .get_location_at_addr(self.get_virtual_address())
     }
 
     pub fn get_virtual_address(&self) -> usize {
         let regs = ptrace::getregs(self.pid).expect("Could not get registers.");
         (regs.rip as usize) - self.base_address
+    }
+
+    /// Retrieve the current canonical frame address (CFA).
+    /// See DWARF standarf v4, section 6.4 Call Frame Information.
+    pub fn get_cfa(&self) -> usize {
+        // CFA is the sp at the call site of the current function
+        // In the preamble:     mov    rbp,rsp
+        // rbp is the old stack pointer after call
+        // ret would pop into rip --> + 8 bytes
+        // the old sp should be rbp + 8?
+
+        let regs = ptrace::getregs(self.pid).expect("Could not get registers.");
+        let cfa = regs.rbp + 16;
+
+        cfa as usize
+    }
+
+    pub fn get_offset_from_cfa(&self, rbp: usize, offset: isize) -> usize {
+        // Breakpoint 1, complex_function (a=21845, b=1431654909) at segfault.c:1
+        // 1       int complex_function(int a, int b) {
+        // (gdb) s
+        // 2           return 2*a + b;
+        // (gdb) s
+        // 3       }
+        // (gdb) i f
+        // Stack level 0, frame at 0x7fffffffddf0:
+        // rip = 0x555555555142 in complex_function (segfault.c:3); saved rip = 0x555555555198
+        // called by frame at 0x7fffffffde20
+        // source language c.
+        // Arglist at 0x7fffffffddd8, args: a=1, b=2
+        // Locals at 0x7fffffffddd8, Previous frame's sp is 0x7fffffffddf0                  <---- this is RBP+16 == CFA
+        // Saved registers:
+        // rbp at 0x7fffffffdde0, rip at 0x7fffffffdde8
+        // (gdb) i r rbp rsp
+        // rbp            0x7fffffffdde0      0x7fffffffdde0
+        // rsp            0x7fffffffdde0      0x7fffffffdde0
+        // (gdb) x/1dw $rbp+16-20                                                           <---- -20 fbreg offset
+        // 0x7fffffffdddc: 1
+        // (gdb) x/1dw $rbp+16-24                                                           <---- -24 fbreg offset
+        // 0x7fffffffddd8: 2
+
+        let cfa = rbp + 16;
+        let address = add_offset(cfa, offset);
+        // println!(
+        //     "rbp {:#18x}\tcfa {:#18x}\toffset {} = {:#18x}",
+        //     rbp, cfa, offset, address
+        // );
+        address
+    }
+
+    pub fn read_bytes(&self, addr: usize, _amount: usize) -> Result<Vec<u8>, nix::Error> {
+        let aligned_addr = self.align_addr_to_word(addr);
+        let _byte_offset = addr - aligned_addr;
+        let word = ptrace::read(self.pid, aligned_addr as ptrace::AddressType)? as u64;
+        println!("{:#034x}", word);
+        let bytes = word.to_le_bytes();
+        for byte in bytes {
+            println!("{:#06x}", byte);
+        }
+
+        Ok(vec![])
     }
 
     pub fn print_current_source_line(&self, range: usize) {
@@ -72,21 +134,102 @@ impl Target {
         let regs = ptrace::getregs(self.pid).expect("Could not get registers.");
 
         let mut rbp = regs.rbp;
+        let mut rip = regs.rip;
+        let mut i = 0;
 
-        while {
-            println!("rbp = {:#x}", rbp);
-            if let Some(location) = self.debug_info.get_location_at_addr(regs.rip as usize - self.base_address + 8) {
-                println!("{}", location);
+        println!("Backtrace:");
+        while rbp != 0x0 {
+            if let Some(location) = self
+                .debug_info
+                .get_location_at_addr(rip as usize - self.base_address)
+            {
+                println!("{} {}", i, location);
+
+                // switch to get function by address
+                if let Some(function) = self
+                    .debug_info
+                    .dwarf_info
+                    .get_function_by_name(&location.function_name)
+                {
+                    for formal in &function.formal_parameters {
+                        self.print_local(
+                            rbp as usize,
+                            formal.fbreg_offset as isize,
+                            formal.t,
+                            &formal.name,
+                        );
+                    }
+                    for local in &function.local_variables {
+                        self.print_local(
+                            rbp as usize,
+                            local.fbreg_offset as isize,
+                            local.t,
+                            &local.name,
+                        );
+                    }
+                }
+            } else {
+                break;
             }
-            rbp = ptrace::read(self.pid, rbp as *mut c_void).expect("Could not read memory") as u64;
-            rbp != 0x0
-        } {}
+            rip = ptrace::read(self.pid, (rbp + 8) as *mut c_void).expect("Could not read next rip")
+                as u64;
+            rbp =
+                ptrace::read(self.pid, rbp as *mut c_void).expect("Could not read next rbp") as u64;
+            i += 1;
+        }
+    }
+
+    fn print_local(&self, rbp: usize, fbreg_offset: isize, t: usize, name: &str) {
+        let val_addr = self.get_offset_from_cfa(rbp as usize, fbreg_offset as isize);
+        let val_size = self
+            .debug_info
+            .dwarf_info
+            .get_type_byte_size(t)
+            .expect("Could not get type byte size") as u32;
+        let val = ptrace::read(self.pid, val_addr as *mut c_void).unwrap_or(0) as u64;
+        let val_mask = (1 as u64).checked_shl(8 * val_size).map(|v| v - 1).unwrap_or(!0);
+        let val = val & val_mask;
+        println!("{} = {:#18x}", name, val);
     }
 
     pub fn print_registers(&self) -> Result<(), nix::Error> {
         let regs = ptrace::getregs(self.pid)?;
-        println!("{:?}", regs);
+        let rbp_pointee = ptrace::read(self.pid, regs.rbp as *mut c_void).ok();
+        let rsp_pointee = ptrace::read(self.pid, regs.rsp as *mut c_void).ok();
+
+        println!("rax\t{:#18x}", regs.rax);
+        println!("rbx\t{:#18x}", regs.rbx);
+        println!("rcx\t{:#18x}", regs.rcx);
+        println!("rdx\t{:#18x}", regs.rdx);
+
+        println!("rsi\t{:#18x}", regs.rsi);
+        println!("rdi\t{:#18x}", regs.rdi);
+        print!("rbp\t{:#18x}", regs.rbp);
+        if let Some(rbp_pointee) = rbp_pointee {
+            println!("\t-> {:#18x}", rbp_pointee);
+        } else {
+            println!("\t-> <invalid>");
+        }
+        print!("rsp\t{:#18x}", regs.rsp);
+        if let Some(rsp_pointee) = rsp_pointee {
+            println!("\t-> {:#18x}", rsp_pointee);
+        } else {
+            println!("\t-> <invalid>");
+        }
+
+        println!("r8\t{:#18x}", regs.r8);
+        println!("r9\t{:#18x}", regs.r9);
+        println!("r10\t{:#18x}", regs.r10);
+        println!("r11\t{:#18x}", regs.r11);
+        println!("r12\t{:#18x}", regs.r12);
+        println!("r13\t{:#18x}", regs.r13);
+        println!("r14\t{:#18x}", regs.r14);
+        println!("r15\t{:#18x}", regs.r15);
+
         Ok(())
+
+        // println!("{:?}", regs);
+        // Ok(())
     }
 
     pub fn step(&self) -> Result<(), nix::Error> {
@@ -159,7 +302,7 @@ impl Target {
             );
             let breakpoint = self.breakpoints.get(&addr).unwrap();
             breakpoint.pprint(&self.debug_info, self.base_address);
-            println!(" created.");
+            println!("");
         }
         Ok(())
     }

@@ -13,3 +13,11 @@ pub fn get_base_address(pid: Pid) -> Result<usize, ()> {
 
     Ok(usize::from_str_radix(parts[0], 16).unwrap())
 }
+
+pub fn add_offset(address: usize, offset: isize) -> usize {
+    if offset < 0 {
+        address.checked_sub(offset.wrapping_abs() as usize).expect("Error during add_offset")
+    } else {
+        address.checked_add(offset as usize).expect("Error during add_offset")
+    }
+}

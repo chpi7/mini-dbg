@@ -18,6 +18,11 @@ impl Debugger {
     }
 
     pub fn run(&mut self) -> Result<(), ()> {
+
+        let target_process = Target::create(&self.target_path)
+            .expect("Could not instantiate target process.");
+        self.target_process = Some(target_process);
+
         self.run_repl();
 
         Ok(())
@@ -72,14 +77,7 @@ impl Debugger {
     fn handle_command(&mut self, cmd: &ReplCommand) {
         match cmd {
             ReplCommand::Start => {
-                if let Some(t) = &mut self.target_process {
-                    println!("Killing child.");
-                    t.kill().expect("Could not kill child.");
-                    t.wait().unwrap();
-                }
-                let target_process = Target::create(&self.target_path)
-                    .expect("Could not instantiate target process.");
-                self.target_process = Some(target_process);
+                println!("doesnt do anything atm")
             }
             ReplCommand::Continue => {
                 if let Some(target) = &mut self.target_process {
@@ -102,7 +100,7 @@ impl Debugger {
             }
             ReplCommand::SetBpName(name) => {
                 if let Some(target) = &mut self.target_process {
-                    if let Some(f) = target.debug_info.get_function_by_name(name) {
+                    if let Some(f) = target.debug_info.dwarf_info.get_function_by_name(name) {
                         let addr = f.address_range.first().unwrap().0 + target.base_address;
                         target
                             .set_breakpoint(addr)
@@ -139,6 +137,15 @@ impl Debugger {
             ReplCommand::Backtrace => {
                 if let Some(target) = &self.target_process {
                     target.print_backtrace();
+                }
+            }
+            ReplCommand::GetVar => {
+                if let Some(target) = &self.target_process {
+                    let cfa = target.get_cfa();
+                    let fun = target.debug_info.dwarf_info.get_function_by_name("main").unwrap();
+                    let var = fun.local_variables.iter().find(|v| v.name == "a").unwrap();
+                    let addr = cfa as i64 + var.fbreg_offset;
+                    target.read_bytes(addr as usize, 4).unwrap();
                 }
             }
             ReplCommand::Frame => todo!(),

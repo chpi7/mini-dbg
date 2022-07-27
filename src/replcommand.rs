@@ -14,6 +14,7 @@ pub enum ReplCommand {
     SingleStep,
     Backtrace,
     Frame,
+    GetVar
 }
 
 /// Very sophisticated command parser.
@@ -26,9 +27,7 @@ pub fn get_command() -> ReplCommand {
 
     match input.trim() {
         "cont" => ReplCommand::Continue,
-        "c" => ReplCommand::Continue,
         "r" => ReplCommand::Continue,
-        "start" => ReplCommand::Start,
         "exit" => ReplCommand::Exit,
         "e" => ReplCommand::Exit,
         "regs" => ReplCommand::GetRegs,
@@ -37,28 +36,32 @@ pub fn get_command() -> ReplCommand {
         "back" => ReplCommand::Backtrace,
         "frame" => ReplCommand::Frame,
         "f" => ReplCommand::Frame,
+        "get" => ReplCommand::GetVar,
         _ => {
-            if input.starts_with("bp") {
+            if input.starts_with("b") {
                 let parts: Vec<&str> = input.trim().split(' ').collect();
-                if parts.len() < 3 {
-                    println!("Too few arguments in bp command");
-                    ReplCommand::Unknown
-                } else {
-                    let is_set = parts[1] == "set";
-                    if let Some(parsed_addr) = parse_address(parts[2]) {
-                        if is_set {
-                            ReplCommand::SetBp(parsed_addr)
-                        } else {
-                            ReplCommand::DeleteBp(parsed_addr) // this is an index of the bp!
-                        }
+                if parts.len() == 2 {
+                    if let Some(parsed_addr) = parse_address(parts[1]) {
+                        ReplCommand::SetBp(parsed_addr)
                     } else {
-                        if is_set {
-                            ReplCommand::SetBpName(String::from(parts[2]))
-                        } else {
-                            println!("DeleteBp requires a number as an argument.");
-                            ReplCommand::Unknown
-                        }
+                        ReplCommand::SetBpName(String::from(parts[1]))
                     }
+                } else {
+                    println!("unsupported breakpoint command format.");
+                    ReplCommand::Unknown
+                }
+            } else if input.starts_with("rb") {
+                let parts: Vec<&str> = input.trim().split(' ').collect();
+                if parts.len() == 2 {
+                    if let Some(parsed_addr) = parse_address(parts[1]) {
+                        ReplCommand::DeleteBp(parsed_addr)
+                    } else {
+                        println!("unsupported breakpoint command format.");
+                        ReplCommand::Unknown
+                    }
+                } else {
+                    println!("unsupported breakpoint command format.");
+                    ReplCommand::Unknown
                 }
             } else {
                 ReplCommand::Unknown
