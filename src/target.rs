@@ -54,11 +54,13 @@ impl Target {
         })
     }
 
+    /// Get location to which rip points.
     pub fn get_current_location(&self) -> Option<Location> {
         self.debug_info
             .get_location_at_addr(self.get_virtual_address())
     }
 
+    /// Get rip relative to the base address.
     pub fn get_virtual_address(&self) -> usize {
         let regs = ptrace::getregs(self.pid).expect("Could not get registers.");
         (regs.rip as usize) - self.base_address
@@ -67,16 +69,8 @@ impl Target {
     /// Retrieve the current canonical frame address (CFA).
     /// See DWARF standarf v4, section 6.4 Call Frame Information.
     pub fn get_cfa(&self) -> usize {
-        // CFA is the sp at the call site of the current function
-        // In the preamble:     mov    rbp,rsp
-        // rbp is the old stack pointer after call
-        // ret would pop into rip --> + 8 bytes
-        // the old sp should be rbp + 8?
-
         let regs = ptrace::getregs(self.pid).expect("Could not get registers.");
-        let cfa = regs.rbp + 16;
-
-        cfa as usize
+        (regs.rbp + 16) as usize
     }
 
     pub fn get_offset_from_cfa(&self, rbp: usize, offset: isize) -> usize {
@@ -122,7 +116,7 @@ impl Target {
             println!("{:#06x}", byte);
         }
 
-        Ok(vec![])
+        todo!();
     }
 
     pub fn print_current_source_line(&self, range: usize) {
@@ -145,7 +139,7 @@ impl Target {
             {
                 println!("{} {}", i, location);
 
-                // switch to get function by address
+                // TODO: switch to get function by address
                 if let Some(function) = self
                     .debug_info
                     .dwarf_info
@@ -187,7 +181,10 @@ impl Target {
             .get_type_byte_size(t)
             .expect("Could not get type byte size") as u32;
         let val = ptrace::read(self.pid, val_addr as *mut c_void).unwrap_or(0) as u64;
-        let val_mask = (1 as u64).checked_shl(8 * val_size).map(|v| v - 1).unwrap_or(!0);
+        let val_mask = (1 as u64)
+            .checked_shl(8 * val_size)
+            .map(|v| v - 1)
+            .unwrap_or(!0);
         let val = val & val_mask;
         println!("{} = {:#18x}", name, val);
     }
@@ -227,14 +224,10 @@ impl Target {
         println!("r15\t{:#18x}", regs.r15);
 
         Ok(())
-
-        // println!("{:?}", regs);
-        // Ok(())
     }
 
     pub fn step(&self) -> Result<(), nix::Error> {
-        ptrace::step(self.pid, None)?;
-        Ok(())
+        ptrace::step(self.pid, None)
     }
 
     pub fn cont(&mut self) -> Result<(), nix::Error> {
@@ -347,10 +340,6 @@ impl Target {
         let orig_byte = (word >> 8 * byte_offset) & 0xff;
         let masked_word = word & !(0xff << 8 * byte_offset);
         let updated_word = masked_word | ((byte as u64) << 8 * byte_offset);
-        // println!(
-        //     "Replace at {:#018x}: {:#18x} -> {:#18x}",
-        //     aligned_addr, word, updated_word
-        // );
         unsafe {
             ptrace::write(
                 self.pid,

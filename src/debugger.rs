@@ -73,7 +73,6 @@ impl Debugger {
         }
     }
 
-    /// Returns true if we should run the child, and false if not.
     fn handle_command(&mut self, cmd: &ReplCommand) {
         match cmd {
             ReplCommand::Start => {
